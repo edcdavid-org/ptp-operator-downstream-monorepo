@@ -1,0 +1,14 @@
+name: "ptp-operator: CI tests AWS"
+on:
+  pull_request_target:
+    types: [labeled, synchronize]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  aws-ci:
+    uses: edcdavid-org/ptp-operator-upstream-monorepo/.github/workflows/_reusable-ptp-operator-aws-ci.yml@main
+    secrets: inherit

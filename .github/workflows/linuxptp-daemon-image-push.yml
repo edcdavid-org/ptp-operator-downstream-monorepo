@@ -1,0 +1,16 @@
+name: "linuxptp-daemon: Push image on merge to main"
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'pkg/linuxptp-daemon/**'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  push-image:
+    uses: edcdavid-org/ptp-operator-upstream-monorepo/.github/workflows/_reusable-linuxptp-daemon-image-push.yml@main
+    secrets: inherit
