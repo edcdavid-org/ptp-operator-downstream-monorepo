@@ -3,9 +3,9 @@ package pods
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"regexp"
 	"time"
 
@@ -13,9 +13,10 @@ import (
 	"github.com/openshift/ptp-operator/test/pkg"
 	"github.com/openshift/ptp-operator/test/pkg/client"
 	testclient "github.com/openshift/ptp-operator/test/pkg/client"
+
 	"github.com/openshift/ptp-operator/test/pkg/images"
+
 	"github.com/sirupsen/logrus"
-	"github.com/test-network-function/l2discovery-lib/pkg/pods"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -24,28 +25,9 @@ import (
 	"k8s.io/utils/pointer"
 )
 
-// GetLog connects to a pod and fetches log
-func GetLog(p *corev1.Pod, containerName string) (string, error) {
-	req := testclient.Client.CoreV1().Pods(p.Namespace).GetLogs(p.Name, &corev1.PodLogOptions{Container: containerName})
-	log, err := req.Stream(context.Background())
-	if err != nil {
-		return "", err
-	}
-	defer log.Close()
-
-	buf := new(bytes.Buffer)
-	_, err = io.Copy(buf, log)
-
-	if err != nil {
-		return "", err
-	}
-
-	return buf.String(), nil
-}
-
 // ExecCommand runs command in the pod and returns buffer output
-func ExecCommand(cs *testclient.ClientSet, pod *corev1.Pod, containerName string, command []string) (bytes.Buffer, error) {
-	var buf bytes.Buffer
+// If mergeOutput is true, stderr will be merged into stdout, otherwise they are separate
+func ExecCommand(cs *testclient.ClientSet, mergeOutput bool, pod *corev1.Pod, containerName string, command []string) (stdoutBuf, stderrBuf bytes.Buffer, err error) {
 	req := testclient.Client.CoreV1().RESTClient().
 		Post().
 		Namespace(pod.Namespace).
@@ -55,25 +37,38 @@ func ExecCommand(cs *testclient.ClientSet, pod *corev1.Pod, containerName string
 		VersionedParams(&corev1.PodExecOptions{
 			Container: containerName,
 			Command:   command,
-			Stdin:     true,
+			Stdin:     false, // Disable stdin for non-interactive commands
 			Stdout:    true,
 			Stderr:    true,
-			TTY:       true,
+			TTY:       false, // Always disable TTY
 		}, scheme.ParameterCodec)
 
+	// Note: Using SPDY executor (deprecated but still functional)
+	// TODO: Upgrade to WebSocket executor when client-go version supports it
 	exec, err := remotecommand.NewSPDYExecutor(cs.Config, "POST", req.URL())
 	if err != nil {
-		return buf, err
+		return stdoutBuf, stderrBuf, err
 	}
 
-	err = exec.Stream(remotecommand.StreamOptions{
-		Stdin:  os.Stdin,
-		Stdout: &buf,
-		Stderr: os.Stderr,
-		Tty:    true,
+	// Always stream to separate buffers first
+	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdin:  nil, // No stdin for non-interactive commands
+		Stdout: &stdoutBuf,
+		Stderr: &stderrBuf,
+		Tty:    false, // Always disable TTY
 	})
 
-	return buf, err
+	// If mergeOutput is true, append stderr content to stdout buffer
+	if mergeOutput {
+		stdoutBuf.Write(stderrBuf.Bytes())
+	}
+
+	logrus.Tracef("ExecCommand podName=%s containerName=%s command=%v stdout=%s stderr=%s err=%s", pod.Name, containerName, command, stdoutBuf.String(), stderrBuf.String(), err)
+	if err != nil {
+		return stdoutBuf, stderrBuf, fmt.Errorf("exec.StreamWithContext failure. Stdout: %s, Stderr: %s, Err: %w", stdoutBuf.String(), stderrBuf.String(), err)
+	}
+
+	return stdoutBuf, stderrBuf, nil
 }
 
 // returns true if the pod passed as paremeter is running on the node selected by the label passed as a parameter.
@@ -143,33 +138,142 @@ func WaitForPhase(cs *testclient.ClientSet, pod *corev1.Pod, phaseType corev1.Po
 	})
 }
 
-func WaitUntilLogIsDetected(pod *corev1.Pod, timeout time.Duration, neededLog string) {
-	gomega.Eventually(func() string {
-		logs, _ := GetLog(pod, pkg.PtpContainerName)
-		logrus.Debugf("wait for log = %s in pod=%s.%s", neededLog, pod.Namespace, pod.Name)
-		return logs
-	}, timeout, 1*time.Second).Should(gomega.ContainSubstring(neededLog), fmt.Sprintf("Timeout to detect log %q in pod %q", neededLog, pod.Name))
+func findRegexInStream(stream io.ReadCloser, r *regexp.Regexp, timeout time.Duration) (matches [][]string, err error) {
+	logContent := ""
+	buf := make([]byte, 2000)
+
+	for start := time.Now(); time.Since(start) <= timeout && len(matches) == 0; {
+		numBytes, err := stream.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				logContent += string(buf[:numBytes])
+				matches = r.FindAllStringSubmatch(logContent, -1)
+				break
+			} else {
+				return nil, fmt.Errorf("error reading from stream: %s", err)
+			}
+		}
+
+		if numBytes == 0 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		logContent += string(buf[:numBytes])
+		matches = r.FindAllStringSubmatch(logContent, -1)
+	}
+
+	if len(matches) == 0 {
+		return matches, errors.New("timedout waiting for matches")
+	}
+
+	return matches, nil
 }
 
-// looks for a given pattern in a pod's log and returns when found
-func WaitUntilLogIsDetectedRegex(pod *corev1.Pod, timeout time.Duration, regex string) string {
-	var results []string
-	gomega.Eventually(func() []string {
-		podLogs, _ := pods.GetLog(pod, pkg.PtpContainerName)
-		logrus.Debugf("wait for log = %s in pod=%s.%s", regex, pod.Namespace, pod.Name)
-		r := regexp.MustCompile(regex)
-		var id string
-
-		for _, submatches := range r.FindAllStringSubmatchIndex(podLogs, -1) {
-			id = string(r.ExpandString([]byte{}, "$1", podLogs, submatches))
-			results = append(results, id)
-		}
-		return results
-	}, timeout, 5*time.Second).Should(gomega.Not(gomega.HaveLen(0)), fmt.Sprintf("Timeout to detect regex %q in pod %q", regex, pod.Name))
-	if len(results) != 0 {
-		return results[len(results)-1]
+// returns last Regex match in the logs for a given pod
+func GetPodLogsRegexSince(namespace string, podName string, containerName, regex string, isLiteralText bool, timeout time.Duration, since time.Time) (matches [][]string, err error) {
+	const matchOnlyFullLines = `\s*^`
+	if isLiteralText {
+		regex = regexp.QuoteMeta(regex)
+	} else {
+		regex += matchOnlyFullLines
 	}
-	return ""
+
+	r := regexp.MustCompile(regex)
+
+	podLogOptions := corev1.PodLogOptions{
+		Container: containerName,
+		Follow:    true,
+		SinceTime: &metav1.Time{Time: since},
+	}
+
+	podLogRequest := testclient.Client.CoreV1().Pods(namespace).GetLogs(podName, &podLogOptions)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	stream, err := podLogRequest.Stream(ctx)
+	if err != nil {
+		return matches, fmt.Errorf("failed to open log streamn for %s/%s container=%s, err=%s", namespace, podName, containerName, err)
+	}
+	defer stream.Close()
+
+	matches, err = findRegexInStream(stream, r, timeout)
+	if err != nil {
+		return matches, fmt.Errorf("could not find regex in log stream for %s/%s container=%s, err=%s", namespace, podName, containerName, err)
+	}
+
+	return matches, nil
+}
+
+// returns last Regex match in the logs for a given pod.
+// It first reads all existing logs (without follow) to get the complete set of
+// matches, so that callers using matches[len-1] get the most recent entry.
+// If no match is found in the existing logs, it falls back to following the
+// stream and waiting for new content up to the given timeout.
+func GetPodLogsRegex(namespace string, podName string, containerName, regex string, isLiteralText bool, timeout time.Duration) (matches [][]string, err error) {
+	const matchOnlyFullLines = `\s*^`
+	if isLiteralText {
+		regex = regexp.QuoteMeta(regex)
+	} else {
+		regex += matchOnlyFullLines
+	}
+
+	r := regexp.MustCompile(regex)
+
+	// Pass 1: read all existing log content without following.
+	// Use io.ReadAll to drain the entire log before matching, so that
+	// FindAllStringSubmatch returns ALL matches (not just the first chunk's).
+	noFollowOpts := corev1.PodLogOptions{
+		Container: containerName,
+		Follow:    false,
+	}
+	noFollowReq := testclient.Client.CoreV1().Pods(namespace).GetLogs(podName, &noFollowOpts)
+	snapCtx, snapCancel := context.WithTimeout(context.Background(), pkg.TimeoutIn3Minutes)
+	defer snapCancel()
+	snapStream, err := noFollowReq.Stream(snapCtx)
+	if err == nil {
+		logContent, readErr := io.ReadAll(snapStream)
+		snapStream.Close()
+		if readErr == nil && len(logContent) > 0 {
+			matches = r.FindAllStringSubmatch(string(logContent), -1)
+			if len(matches) > 0 {
+				return matches, nil
+			}
+		}
+	}
+
+	// Pass 2: no match in existing logs — follow the stream for new content.
+	followOpts := corev1.PodLogOptions{
+		Container: containerName,
+		Follow:    true,
+	}
+	followReq := testclient.Client.CoreV1().Pods(namespace).GetLogs(podName, &followOpts)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	stream, err := followReq.Stream(ctx)
+	if err != nil {
+		return matches, fmt.Errorf("failed to open log streamn for %s/%s container=%s, err=%s", namespace, podName, containerName, err)
+	}
+	defer stream.Close()
+
+	matches, err = findRegexInStream(stream, r, timeout)
+	if err != nil {
+		return matches, fmt.Errorf("could not find regex in log stream for %s/%s container=%s, err=%s", namespace, podName, containerName, err)
+	}
+
+	return matches, nil
+}
+
+func ExecutePtpInterfaceCommand(pod corev1.Pod, interfaceName string, command string) {
+	const (
+		pollingInterval = 3 * time.Second
+	)
+	gomega.Eventually(func() error {
+		_, _, err := ExecCommand(client.Client, true, &pod, "container-00", []string{"sh", "-c", command})
+		return err
+	}, pkg.TimeoutIn10Minutes, pollingInterval).Should(gomega.BeNil())
 }
 
 func CheckRestart(pod corev1.Pod) {
@@ -180,7 +284,7 @@ func CheckRestart(pod corev1.Pod) {
 	)
 
 	gomega.Eventually(func() error {
-		_, err := ExecCommand(client.Client, &pod, "container-00", []string{"chroot", "/host", "shutdown", "-r"})
+		_, _, err := ExecCommand(client.Client, true, &pod, "container-00", []string{"chroot", "/host", "shutdown", "-r"})
 		return err
 	}, pkg.TimeoutIn10Minutes, pollingInterval).Should(gomega.BeNil())
 }
@@ -227,6 +331,7 @@ func RedefineAsPrivileged(pod *corev1.Pod, containerName string) (*corev1.Pod, e
 
 	return pod, nil
 }
+
 func containerByName(pod *corev1.Pod, containerName string) *corev1.Container {
 	if containerName == "" {
 		return &pod.Spec.Containers[0]
